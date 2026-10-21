@@ -1,8 +1,15 @@
 import { Op } from "sequelize";
-import { Activity, Category, ReminderLog, User, UserSetting } from "../models/index.js";
+import {
+  Activity,
+  Category,
+  ReminderLog,
+  User,
+  UserSetting,
+} from "../models/index.js";
 import { buildReminder } from "./reminderMessages.js";
 import { emailConfigured, sendEmail } from "./mailer.js";
 import { sendWhatsApp, whatsappConfigured } from "./whatsapp.js";
+import { enqueueCollabReminders, processOutbox } from "./collabNotifier.js";
 
 const HOUR = 3600 * 1000;
 const MAX_ATTEMPTS = 6;
@@ -10,11 +17,18 @@ const RETRY_DELAY_MS = 10 * 60 * 1000;
 let running = false;
 const warned = new Set();
 
-const currentStage = (ms) => (ms <= 0 ? "overdue" : ms <= 2 * HOUR ? "2h" : "24h");
+const currentStage = (ms) =>
+  ms <= 0 ? "overdue" : ms <= 2 * HOUR ? "2h" : "24h";
+
 
 async function send(channel, user, msg) {
   if (channel === "email")
-    return sendEmail({ to: user.email, subject: msg.subject, text: msg.text, html: msg.html });
+    return sendEmail({
+      to: user.email,
+      subject: msg.subject,
+      text: msg.text,
+      html: msg.html,
+    });
   return sendWhatsApp({ to: user.phone, text: msg.text, params: msg.waParams });
 }
 
@@ -32,18 +46,34 @@ async function deliver(activity, user, stage, channel) {
 
   if (!created) {
     if (log.status === "sent" || log.attempts >= MAX_ATTEMPTS) return;
-    if (log.status === "pending" && Date.now() - new Date(log.updated_at) < 2 * 60 * 1000) return;
-    if (log.status === "failed" && Date.now() - new Date(log.updated_at) < RETRY_DELAY_MS) return;
+    if (
+      log.status === "pending" &&
+      Date.now() - new Date(log.updated_at) < 2 * 60 * 1000
+    )
+      return;
+    if (
+      log.status === "failed" &&
+      Date.now() - new Date(log.updated_at) < RETRY_DELAY_MS
+    )
+      return;
   }
 
   await log.update({ status: "pending", attempts: log.attempts + 1 });
   try {
     await send(channel, user, buildReminder({ user, activity, stage }));
     await log.update({ status: "sent", error: null });
-    console.log(`Reminder ${stage} -> ${channel} (aktivitas #${activity.id}) terkirim`);
+    console.log(
+      `Reminder ${stage} -> ${channel} (aktivitas #${activity.id}) terkirim`,
+    );
   } catch (e) {
-    await log.update({ status: "failed", error: String(e.message).slice(0, 500) });
-    console.error(`Reminder ${stage} -> ${channel} (aktivitas #${activity.id}) gagal:`, e.message);
+    await log.update({
+      status: "failed",
+      error: String(e.message).slice(0, 500),
+    });
+    console.error(
+      `Reminder ${stage} -> ${channel} (aktivitas #${activity.id}) gagal:`,
+      e.message,
+    );
   }
 }
 
@@ -55,13 +85,23 @@ export async function runReminderCheck() {
     const activities = await Activity.findAll({
       where: {
         status: { [Op.ne]: "completed" },
-        deadline_at: { [Op.between]: [new Date(now - 24 * HOUR), new Date(now + 24 * HOUR)] },
+        deadline_at: {
+          [Op.between]: [new Date(now - 24 * HOUR), new Date(now + 24 * HOUR)],
+        },
       },
       include: [
         Category,
         {
           model: User,
-          attributes: ["id", "name", "email", "phone", "timezone", "email_verified_at", "phone_verified_at"],
+          attributes: [
+            "id",
+            "name",
+            "email",
+            "phone",
+            "timezone",
+            "email_verified_at",
+            "phone_verified_at",
+          ],
           include: [{ model: UserSetting }],
         },
       ],
@@ -85,14 +125,17 @@ export async function runReminderCheck() {
       // whatsapp
       if (!prefs?.notify_whatsapp) skip.push("WhatsApp dimatikan");
       else if (!user.phone) skip.push("nomor WhatsApp kosong");
-      else if (!user.phone_verified_at) skip.push("nomor WhatsApp belum terverifikasi");
+      else if (!user.phone_verified_at)
+        skip.push("nomor WhatsApp belum terverifikasi");
       else if (!whatsappConfigured()) skip.push("WhatsApp belum dikonfigurasi");
       else channels.push("whatsapp");
 
       const key = `${a.id}:${skip.join()}`;
       if (skip.length && !warned.has(key)) {
         warned.add(key);
-        console.log(`Reminder aktivitas #${a.id}: saluran dilewati (${skip.join(", ")})`);
+        console.log(
+          `Reminder aktivitas #${a.id}: saluran dilewati (${skip.join(", ")})`,
+        );
       }
 
       for (const ch of channels) await deliver(a, user, stage, ch);
@@ -104,9 +147,32 @@ export async function runReminderCheck() {
   }
 }
 
+let collabRunning = false;
+async function collabCycle() {
+  if (collabRunning) return;
+  collabRunning = true;
+  try {
+    await enqueueCollabReminders();
+    await processOutbox();
+  } catch (e) {
+    console.error(
+      "Collab scheduler error:",
+      e.name,
+      e.message || "(tanpa pesan)",
+    );
+  } finally {
+    collabRunning = false;
+  }
+}
+
 export function startScheduler() {
-  if (process.env.ENABLE_SCHEDULER === "false") return console.log("Scheduler pengingat dimatikan");
+  if (process.env.ENABLE_SCHEDULER === "false")
+    return console.log("Scheduler pengingat dimatikan");
   console.log("Scheduler pengingat deadline aktif (cek tiap 1 menit)");
-  setTimeout(runReminderCheck, 5000);
-  setInterval(runReminderCheck, 60 * 1000);
+  const tick = () => {
+    runReminderCheck();
+    collabCycle();
+  };
+  setTimeout(tick, 5000);
+  setInterval(tick, 60 * 1000);
 }

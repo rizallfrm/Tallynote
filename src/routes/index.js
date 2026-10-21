@@ -16,6 +16,7 @@ import * as Rf from "../controllers/reflection.controller.js";
 import * as Ask from "../controllers/ask.controller.js";
 import * as Bk from "../controllers/backup.controller.js";
 import * as N from "../controllers/notification.controller.js";
+import collab from "./collab.js";
 
 
 const r = Router();
@@ -91,4 +92,5 @@ r.post("/ask", auth, aiLimiter, Ask.ask);
 // backup
 r.get("/backup", auth, Bk.exportData);
 r.post("/backup/import", auth, Bk.importData);
+r.use(collab);
 export default r;

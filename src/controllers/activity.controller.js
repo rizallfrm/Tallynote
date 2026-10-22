@@ -6,7 +6,10 @@ import {
   Category,
   ReminderLog,
   Tag,
+  Workspace,
 } from "../models/index.js";
+import { ensureUserSynced } from "../services/collabSync.js";
+
 import {
   generateActivityFields,
   PROMPT_VERSION,
@@ -31,7 +34,12 @@ const pick = (o, keys) =>
     keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]),
   );
 
-const REL = [Category, { model: Tag, through: { attributes: [] } }];
+const REL = [
+  Category,
+  { model: Tag, through: { attributes: [] } },
+  { model: Workspace, attributes: ["id", "name"] },
+];
+const isLinked = (a) => !!(a.workspace_task_id || a.workspace_meeting_id);
 const findOwn = (req) =>
   Activity.findOne({
     where: { id: req.params.id, user_id: req.user.id },
@@ -166,6 +174,8 @@ export const create = async (req, res, next) => {
 
 export const list = async (req, res, next) => {
   try {
+    await ensureUserSynced(req.user.id); // tugas dan meeting Together ikut muncul di Riwayat
+
     const { start, end, category_id, status, q, tag, favorite } = req.query;
     const dir = req.query.sort === "asc" ? "ASC" : "DESC";
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -178,53 +188,31 @@ export const list = async (req, res, next) => {
     if (category_id) where.category_id = category_id;
     if (status) where.status = status;
     if (favorite === "1") where.is_favorite = true;
+    if (req.query.source === "together") where.workspace_id = { [Op.ne]: null };
+    if (req.query.source === "personal") where.workspace_id = null;
 
     if (tag) {
-      const t = await Tag.findOne({
-        where: { user_id: req.user.id, name: String(tag).toLowerCase() },
-      });
+      const t = await Tag.findOne({ where: { user_id: req.user.id, name: String(tag).toLowerCase() } });
       const ids = t
-        ? (
-            await ActivityTag.findAll({
-              where: { tag_id: t.id },
-              attributes: ["activity_id"],
-            })
-          ).map((r) => r.activity_id)
+        ? (await ActivityTag.findAll({ where: { tag_id: t.id }, attributes: ["activity_id"] })).map((r) => r.activity_id)
         : [];
       where.id = { [Op.in]: ids };
     }
 
     if (q && q.trim()) {
       const like = `%${q.trim().replace(/[%_\\]/g, "\\$&")}%`;
-      where[Op.or] = [
-        "title",
-        "activity_input",
-        "description",
-        "learning",
-        "obstacle",
-      ].map((f) => ({ [f]: { [Op.iLike]: like } }));
+      where[Op.or] = ["title", "activity_input", "description", "learning", "obstacle"].map(
+        (f) => ({ [f]: { [Op.iLike]: like } })
+      );
     }
 
     const { rows, count } = await Activity.findAndCountAll({
-      where,
-      include: REL,
-      distinct: true,
-      order: [
-        ["activity_date", dir],
-        ["id", dir],
-      ],
-      limit,
-      offset: (page - 1) * limit,
+      where, include: REL, distinct: true,
+      order: [["activity_date", dir], ["id", dir]],
+      limit, offset: (page - 1) * limit,
     });
-    res.json({
-      items: rows,
-      total: count,
-      page,
-      pages: Math.max(1, Math.ceil(count / limit)),
-    });
-  } catch (e) {
-    next(e);
-  }
+    res.json({ items: rows, total: count, page, pages: Math.max(1, Math.ceil(count / limit)) });
+  } catch (e) { next(e); }
 };
 
 export const getOne = async (req, res, next) => {
@@ -243,13 +231,17 @@ export const update = async (req, res, next) => {
     const a = await findOwn(req);
     if (!a)
       return res.status(404).json({ message: "Aktivitas tidak ditemukan" });
+    const linked = isLinked(a);
 
-    const body = pick(req.body, EDITABLE);
+    const body = pick(
+      req.body,
+      linked ? ["learning", "obstacle", "is_favorite"] : EDITABLE,
+    );
     if (body.status && !STATUSES.includes(body.status))
       return res.status(422).json({ message: "Status tidak valid" });
     if (body.is_favorite !== undefined) body.is_favorite = !!body.is_favorite;
 
-    const dl = parseDeadline(req.body.deadline_at);
+    const dl = linked ? { skip: true } : parseDeadline(req.body.deadline_at);
     if (dl.error)
       return res.status(422).json({ message: "Format deadline tidak valid" });
     let deadlineChanged = false;
@@ -281,6 +273,13 @@ export const regenerate = async (req, res, next) => {
     const a = await findOwn(req);
     if (!a)
       return res.status(404).json({ message: "Aktivitas tidak ditemukan" });
+    if (isLinked(a))
+      return res
+        .status(400)
+        .json({
+          message: "Aktivitas dari Together tidak bisa digenerate ulang",
+        });
+
     await runAI(a);
     await refreshDailySummary(req.user.id, a.activity_date);
     res.json(a);
@@ -294,6 +293,13 @@ export const remove = async (req, res, next) => {
     const a = await findOwn(req);
     if (!a)
       return res.status(404).json({ message: "Aktivitas tidak ditemukan" });
+    if (isLinked(a))
+      return res
+        .status(400)
+        .json({
+          message:
+            "Aktivitas ini berasal dari Together. Ia terhapus otomatis jika tugas atau meeting-nya dihapus.",
+        });
     const date = a.activity_date;
     await a.destroy();
     await refreshDailySummary(req.user.id, date);
@@ -373,15 +379,19 @@ export const plan = async (req, res, next) => {
 // GET /activities/upcoming: deadline terdekat yang belum selesai
 export const upcoming = async (req, res, next) => {
   try {
-    res.json(await Activity.findAll({
-      where: {
-        user_id: req.user.id,
-        status: { [Op.ne]: "completed" },
-        deadline_at: { [Op.ne]: null },
-      },
-      include: [Category],
-      order: [["deadline_at", "ASC"]],
-      limit: 5,
-    }));
-  } catch (e) { next(e); }
+    res.json(
+      await Activity.findAll({
+        where: {
+          user_id: req.user.id,
+          status: { [Op.ne]: "completed" },
+          deadline_at: { [Op.ne]: null },
+        },
+        include: [Category],
+        order: [["deadline_at", "ASC"]],
+        limit: 5,
+      }),
+    );
+  } catch (e) {
+    next(e);
+  }
 };

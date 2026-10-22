@@ -4,12 +4,18 @@ import {
 } from "../models/index.js";
 import { isAdmin } from "../middlewares/workspace.js";
 import { link, logActivity, notify, timeOnly, when, workspaceName } from "../services/collabNotifier.js";
+import { syncMeeting, syncTask, unlinkTask } from "../services/collabSync.js";
 
 const same = (a, b) => String(a) === String(b);
 const PRIORITY = ["low", "medium", "high"];
 const TSTATUS = ["todo", "in_progress", "done"];
 const PRIO_LABEL = { low: "Rendah", medium: "Sedang", high: "Tinggi" };
 const AUTHOR = { model: User, attributes: ["id", "name", "avatar_url"] };
+
+// kegagalan sinkron ke aktivitas pribadi tidak menggagalkan aksi utama, tetapi tercatat jelas
+const safe = (p, label) =>
+  Promise.resolve(p).catch((e) =>
+    console.error(`Sinkron aktivitas (${label}) gagal:`, e.name, e.message || "(tanpa pesan)", e.parent?.message || ""));
 
 // undefined = tidak diubah, null = dihapus, Date = nilai baru
 const parseDate = (v) => {
@@ -111,26 +117,29 @@ export const createTask = async (req, res, next) => {
     if ((await WorkspaceTask.count({ where: { workspace_id: req.wid } })) >= 1000)
       return res.status(400).json({ message: "Batas 1000 tugas per ruang tercapai" });
 
+    // tanpa penanggung jawab = tugas milik pembuatnya (agar tercatat di Rekap dan Riwayat)
+    const assigneeIds = asg.ids.length ? asg.ids : [Number(req.user.id)];
+
     const task = await sequelize.transaction(async (t) => {
       const task = await WorkspaceTask.create({
         workspace_id: req.wid, created_by: req.user.id, title, priority,
         description: String(b.description || "").trim().slice(0, 3000) || null,
         deadline_at: dl.value ?? null,
       }, { transaction: t });
-      await task.setAssignees(asg.ids, { transaction: t });
+      await task.setAssignees(assigneeIds, { transaction: t });
       return task;
     });
 
     await logActivity(req.wid, req.user.id, `membuat tugas “${title}”`);
-    if (asg.ids.length) {
-      await notify({
-        workspaceId: req.wid, userIds: asg.ids, type: "task", exceptUserId: req.user.id,
-        key: `task_assigned:${task.id}`,
-        text: [`📝 *Tugas baru untukmu*`, `Ruang: ${await workspaceName(req.wid)}`, `Tugas: *${title}*`,
-          `Prioritas: ${PRIO_LABEL[priority]}`, ...(task.deadline_at ? [`Deadline: ${when(task.deadline_at)}`] : []),
-          "", link(`/together/${req.wid}?tab=tasks`)].join("\n"),
-      });
-    }
+    await safe(syncTask(task.id), "buat tugas");
+
+    await notify({
+      workspaceId: req.wid, userIds: assigneeIds, type: "task", exceptUserId: req.user.id,
+      key: `task_assigned:${task.id}`,
+      text: [`📝 *Tugas baru untukmu*`, `Ruang: ${await workspaceName(req.wid)}`, `Tugas: *${title}*`,
+        `Prioritas: ${PRIO_LABEL[priority]}`, ...(task.deadline_at ? [`Deadline: ${when(task.deadline_at)}`] : []),
+        "", link(`/together/${req.wid}?tab=tasks`)].join("\n"),
+    });
     res.status(201).json(await loadTask(task.id, req.wid));
   } catch (e) { next(e); }
 };
@@ -198,6 +207,8 @@ export const updateTask = async (req, res, next) => {
     });
 
     const after = await loadTask(t.id, req.wid);
+    await safe(syncTask(t.id), "ubah tugas");
+
     const now = after.assignees.map((a) => String(a.id));
     const added = now.filter((x) => !before.asg.includes(x));
     const wName = await workspaceName(req.wid);
@@ -238,6 +249,7 @@ export const deleteTask = async (req, res, next) => {
     if (!t) return res.status(404).json({ message: "Tugas tidak ditemukan" });
     if (!same(t.created_by, req.user.id) && !isAdmin(req.member))
       return res.status(403).json({ message: "Hanya pembuat tugas atau admin yang bisa menghapus" });
+    await safe(unlinkTask(t.id), "hapus tugas");
     await t.destroy();
     res.json({ message: "Tugas dihapus" });
   } catch (e) { next(e); }
@@ -316,6 +328,7 @@ export const createMeeting = async (req, res, next) => {
       return m;
     });
 
+    await safe(syncMeeting(meeting.id), "buat meeting");
     await logActivity(req.wid, req.user.id, `menjadwalkan meeting “${data.title}”`);
     await notify({
       workspaceId: req.wid, userIds: members.map((x) => x.user_id), type: "meeting", exceptUserId: req.user.id,
@@ -343,6 +356,7 @@ export const updateMeeting = async (req, res, next) => {
     await m.update(data);
     if (timeChanged)
       await MeetingAttendee.update({ rsvp: "pending" }, { where: { meeting_id: m.id, user_id: { [Op.ne]: req.user.id } } });
+    await safe(syncMeeting(m.id), "ubah meeting");
 
     if (timeChanged || urlChanged) {
       const att = await MeetingAttendee.findAll({ where: { meeting_id: m.id } });
@@ -366,6 +380,7 @@ export const cancelMeeting = async (req, res, next) => {
     if (m.status === "cancelled") return res.json({ message: "Meeting sudah dibatalkan" });
 
     await m.update({ status: "cancelled" });
+    await safe(syncMeeting(m.id), "batal meeting");
     const att = await MeetingAttendee.findAll({ where: { meeting_id: m.id } });
     await notify({
       workspaceId: req.wid, userIds: att.map((a) => a.user_id), type: "meeting", exceptUserId: req.user.id,
@@ -385,6 +400,7 @@ export const rsvp = async (req, res, next) => {
     if (!m) return res.status(404).json({ message: "Meeting tidak ditemukan" });
     if (m.status === "cancelled") return res.status(400).json({ message: "Meeting sudah dibatalkan" });
     await MeetingAttendee.upsert({ meeting_id: m.id, user_id: req.user.id, rsvp: response });
+    await safe(syncMeeting(m.id), "rsvp meeting");
     res.json({ my_rsvp: response });
   } catch (e) { next(e); }
 };
@@ -397,19 +413,28 @@ export const calendar = async (req, res, next) => {
     if (Number.isNaN(+start) || Number.isNaN(+end) || end <= start || end - start > 62 * 86400000)
       return res.status(422).json({ message: "Rentang tanggal tidak valid (maks. 62 hari)" });
 
-    const [tasks, meetings] = await Promise.all([
+    const assignees = { model: User, as: "assignees", attributes: ["id", "name"], through: { attributes: [] } };
+    const [tasks, meetings, undated] = await Promise.all([
       WorkspaceTask.findAll({
         where: { workspace_id: req.wid, deadline_at: { [Op.gte]: start, [Op.lt]: end } },
-        attributes: ["id", "title", "status", "priority", "deadline_at"],
-        include: [{ model: User, as: "assignees", attributes: ["id", "name"], through: { attributes: [] } }],
+        attributes: ["id", "title", "description", "status", "priority", "progress", "deadline_at"],
+        include: [assignees],
         order: [["deadline_at", "ASC"]],
       }),
       WorkspaceMeeting.findAll({
         where: { workspace_id: req.wid, status: "scheduled", starts_at: { [Op.gte]: start, [Op.lt]: end } },
-        attributes: ["id", "title", "starts_at", "ends_at", "meeting_url"],
+        attributes: ["id", "title", "agenda", "starts_at", "ends_at", "meeting_url"],
         order: [["starts_at", "ASC"]],
       }),
+      // tugas aktif tanpa deadline: tidak punya tanggal, ditampilkan terpisah
+      WorkspaceTask.findAll({
+        where: { workspace_id: req.wid, deadline_at: null, status: { [Op.ne]: "done" } },
+        attributes: ["id", "title", "description", "status", "priority", "progress", "deadline_at"],
+        include: [assignees],
+        order: [["id", "DESC"]],
+        limit: 50,
+      }),
     ]);
-    res.json({ tasks, meetings });
+    res.json({ tasks, meetings, undated });
   } catch (e) { next(e); }
 };

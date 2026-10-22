@@ -4,6 +4,7 @@ import {
   sequelize, User, Workspace, WorkspaceInvite, WorkspaceMember,
 } from "../models/index.js";
 import { link, logActivity, notify } from "../services/collabNotifier.js";
+import { removeUserFromWorkspace, removeWorkspaceActivities } from "../services/collabSync.js";
 
 const sha = (t) => crypto.createHash("sha256").update(t).digest("hex");
 const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
@@ -76,6 +77,8 @@ export const update = async (req, res, next) => {
 
 export const remove = async (req, res, next) => {
   try {
+    await removeWorkspaceActivities(req.wid).catch(() => {});
+
     await Workspace.destroy({ where: { id: req.wid } }); // anggota, tugas, forum, dll ikut terhapus (CASCADE)
     res.json({ message: "Ruang dihapus" });
   } catch (e) { next(e); }
@@ -138,6 +141,8 @@ export const removeMember = async (req, res, next) => {
       return res.status(403).json({ message: "Hanya pemilik yang bisa mengeluarkan admin" });
 
     await sequelize.transaction((t) => purgeMember(req.wid, target.user_id, t));
+    await removeUserFromWorkspace(req.wid, target.user_id).catch(() => {});
+
     res.json({ message: "Anggota dikeluarkan" });
   } catch (e) { next(e); }
 };
@@ -147,6 +152,7 @@ export const leave = async (req, res, next) => {
     if (req.member.role === "owner")
       return res.status(400).json({ message: "Pemilik tidak bisa keluar. Pindahkan kepemilikan ke anggota lain atau hapus ruang." });
     await sequelize.transaction((t) => purgeMember(req.wid, req.user.id, t));
+    await removeUserFromWorkspace(req.wid, req.user.id).catch(() => {});
     res.json({ message: "Kamu keluar dari ruang" });
   } catch (e) { next(e); }
 };

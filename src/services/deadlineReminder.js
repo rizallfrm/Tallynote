@@ -20,7 +20,6 @@ const warned = new Set();
 const currentStage = (ms) =>
   ms <= 0 ? "overdue" : ms <= 2 * HOUR ? "2h" : "24h";
 
-
 async function send(channel, user, msg) {
   if (channel === "email")
     return sendEmail({
@@ -83,10 +82,14 @@ export async function runReminderCheck() {
   try {
     const now = Date.now();
     const activities = await Activity.findAll({
-      where: {
+      where: {  
         status: { [Op.ne]: "completed" },
+        workspace_task_id: null,
+        workspace_meeting_id: null,
         deadline_at: {
-          [Op.between]: [new Date(now - 24 * HOUR), new Date(now + 24 * HOUR)],
+          [Op.between]: [
+            [new Date(now - 24 * HOUR), new Date(now + 24 * HOUR)],
+          ],
         },
       },
       include: [

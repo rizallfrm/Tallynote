@@ -109,6 +109,7 @@ WorkspaceMeeting.belongsToMany(User, {
   otherKey: "user_id",
 });
 
+Activity.belongsTo(Workspace, { foreignKey: "workspace_id" });
 export {
   sequelize,
   User,

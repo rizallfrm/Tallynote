@@ -1,12 +1,11 @@
 import { Op } from "sequelize";
-import { Activity, Category, DailySummary, Tag } from "../models/index.js";
+import { Activity, Category, DailySummary, Tag, Workspace } from "../models/index.js";
 
-export const todayStr = () => new Date().toLocaleDateString("en-CA");
+export const todayStr = () =>
+  new Date().toLocaleDateString("en-CA", { timeZone: process.env.APP_TZ || "Asia/Jakarta" });
 
 export async function refreshDailySummary(userId, date) {
-  const rows = await Activity.findAll({
-    where: { user_id: userId, activity_date: date },
-  });
+  const rows = await Activity.findAll({ where: { user_id: userId, activity_date: date } });
   const payload = {
     total_activities: rows.length,
     completed_activities: rows.filter((r) => r.status === "completed").length,
@@ -34,25 +33,25 @@ export function getRange(range, date) {
     return { start: fmt(start), end: fmt(end) };
   }
   if (range === "monthly") {
-    const y = d.getUTCFullYear(),
-      m = d.getUTCMonth();
-    return {
-      start: fmt(new Date(Date.UTC(y, m, 1))),
-      end: fmt(new Date(Date.UTC(y, m + 1, 0))),
-    };
+    const y = d.getUTCFullYear(), m = d.getUTCMonth();
+    return { start: fmt(new Date(Date.UTC(y, m, 1))), end: fmt(new Date(Date.UTC(y, m + 1, 0))) };
   }
   return { start: fmt(d), end: fmt(d) };
 }
 
+async function syncCollab(userId) {
+  const { ensureUserSynced } = await import("./collabSync.js"); // dinamis: menghindari impor melingkar
+  await ensureUserSynced(userId);
+}
+
 export async function getRecap(userId, range, date) {
+  await syncCollab(userId);
+
   const { start, end } = getRange(range, date);
   const activities = await Activity.findAll({
     where: { user_id: userId, activity_date: { [Op.between]: [start, end] } },
-    include: [Category, { model: Tag, through: { attributes: [] } }],
-    order: [
-      ["activity_date", "ASC"],
-      ["id", "ASC"],
-    ],
+    include: [Category, { model: Tag, through: { attributes: [] } }, { model: Workspace, attributes: ["id", "name"] }],
+    order: [["activity_date", "ASC"], ["id", "ASC"]],
   });
   const perDay = await DailySummary.findAll({
     where: { user_id: userId, summary_date: { [Op.between]: [start, end] } },
@@ -64,7 +63,7 @@ export async function getRecap(userId, range, date) {
       completed: a.completed + s.completed_activities,
       reflections: a.reflections + s.reflection_count,
     }),
-    { total: 0, completed: 0, reflections: 0 },
+    { total: 0, completed: 0, reflections: 0 }
   );
   return { range, start, end, totals, perDay, activities };
 }
@@ -76,6 +75,8 @@ const addDays = (s, n) => {
 };
 
 export async function getStats(userId) {
+  await syncCollab(userId);
+
   const today = todayStr();
   const rows = await Activity.findAll({
     where: { user_id: userId },
@@ -84,22 +85,15 @@ export async function getStats(userId) {
   });
 
   const byDate = {};
-  rows.forEach((r) => {
-    byDate[r.activity_date] = (byDate[r.activity_date] || 0) + 1;
-  });
+  rows.forEach((r) => { byDate[r.activity_date] = (byDate[r.activity_date] || 0) + 1; });
 
   // streak saat ini (hari ini belum diisi tidak memutus streak)
   let streak = 0;
   let cur = byDate[today] ? today : addDays(today, -1);
-  while (byDate[cur]) {
-    streak++;
-    cur = addDays(cur, -1);
-  }
+  while (byDate[cur]) { streak++; cur = addDays(cur, -1); }
 
   // streak terpanjang
-  let longest = 0,
-    run = 0,
-    prev = null;
+  let longest = 0, run = 0, prev = null;
   for (const d of Object.keys(byDate).sort()) {
     run = prev && addDays(prev, 1) === d ? run + 1 : 1;
     longest = Math.max(longest, run);
@@ -114,24 +108,18 @@ export async function getStats(userId) {
     return { date, count: byDate[date] || 0 };
   });
 
-  const month = rows.filter((r) =>
-    r.activity_date.startsWith(today.slice(0, 7)),
-  );
+  const month = rows.filter((r) => r.activity_date.startsWith(today.slice(0, 7)));
   const monthDone = month.filter((r) => r.status === "completed").length;
 
   const since = addDays(today, -29);
   const cat = {};
-  rows
-    .filter((r) => r.activity_date >= since)
-    .forEach((r) => {
-      const n = r.Category?.name || "Lainnya";
-      cat[n] = (cat[n] || 0) + 1;
-    });
+  rows.filter((r) => r.activity_date >= since).forEach((r) => {
+    const n = r.Category?.name || "Lainnya";
+    cat[n] = (cat[n] || 0) + 1;
+  });
 
   const weekEnd = addDays(weekStart, 6);
-  const activeDaysThisWeek = Object.keys(byDate).filter(
-    (d) => d >= weekStart && d <= weekEnd,
-  ).length;
+  const activeDaysThisWeek = Object.keys(byDate).filter((d) => d >= weekStart && d <= weekEnd).length;
 
   return {
     today,
